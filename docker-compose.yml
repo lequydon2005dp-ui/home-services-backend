@@ -1,0 +1,176 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: home_services
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  auth-service:
+    build: ./services/auth
+    ports:
+      - "8001:8000"
+    environment:
+      - TWILIO_ACCOUNT_SID=
+      - TWILIO_AUTH_TOKEN=
+      - TWILIO_PHONE_NUMBER=
+
+      - SPEEDSMS_ACCESS_TOKEN=
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./services/auth:/app
+      - ./shared:/app/shared
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  order-service:
+    build: ./services/order
+    ports:
+      - "8002:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - ./services/order:/app
+      - ./shared:/app/shared
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/home_services
+
+  worker-service:
+    build: ./services/worker
+    ports:
+      - "8003:8000"
+    depends_on:
+      - postgres
+      - redis
+    env_file:
+      - .env
+    volumes:
+      - ./services/worker:/app # Mount code của worker-service
+      - ./shared:/app/shared
+
+  matching-service:
+    build: ./services/matching
+    ports:
+      - "8004:8000"
+    depends_on:
+      - postgres
+      - redis
+    env_file:
+      - .env
+    volumes:
+      - ./services/matching:/app
+      - ./shared:/app/shared
+
+  notification-service:
+    build: ./services/notification
+    ports:
+      - "8005:8000"
+    depends_on:
+      - redis
+    volumes:
+      - ./services/notification:/app
+
+  payment-service:
+    build: ./services/payment
+    ports:
+      - "8006:8000"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379
+    restart: unless-stopped
+
+  review-service:
+    build: ./services/review
+    ports:
+      - "8007:8000"
+    depends_on:
+      - postgres
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/home_services
+    volumes:
+      - ./shared:/app/shared
+    restart: unless-stopped
+
+  admin-service:
+    build: ./services/admin
+    ports:
+      - "8008:8000"
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./services/admin:/app
+      - ./shared:/app/shared
+  service-management:
+    build: ./services/service
+    ports:
+      - "8009:8000"
+    depends_on:
+      - postgres
+      - elasticsearch
+    environment:
+      - PYTHONPATH=/app:/
+    env_file:
+      - .env
+    volumes:
+      - ./services/service:/app
+      - ./shared:/app/shared
+volumes:
+  postgres_data:
+  redis_data:
+  es_data:
+
+
+networks:
+  app-network:
+    driver: bridge
