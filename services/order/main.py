@@ -161,33 +161,31 @@ async def list_orders(db: Session = Depends(get_db)):
 
 @app.put("/order/{order_uuid}/accept", tags=["order"])
 async def accept_order(order_uuid: str, request: AcceptJobRequest, db: Session = Depends(get_db)):
-    # 1. Tìm đơn hàng trong DB
+    # 1. Tìm đơn hàng
     order = db.query(Order).filter(Order.order_uuid == order_uuid).first()
-    
     if not order:
-        raise HTTPException(status_code=404, detail="Không tìm thấy đơn hàng này")
+        raise HTTPException(status_code=404, detail="Không tìm thấy đơn hàng")
 
-    # 2. Kiểm tra xem đơn có còn "trống" không (tránh trường hợp 2 thợ cùng bấm nhận)
+    # 2. Chống tranh giành (Race Condition)
     if order.status != "pending":
-        raise HTTPException(
-            status_code=400, 
-            detail="Rất tiếc! Đơn hàng này đã có người khác nhận hoặc đã bị hủy."
-        )
+        raise HTTPException(status_code=400, detail="Đơn này đã có người khác nhận rồi Đôn ơi!")
 
-    # 3. Gán thợ vào đơn và cập nhật trạng thái
+    # 3. Cập nhật DB
     order.status = "assigned"
     order.assigned_worker_id = request.worker_id
     db.commit()
-    db.refresh(order)
 
-    # 4. (Tính năng xịn sò) Bắn thông báo ngược lại cho Customer là "Đã có thợ nhận đơn"
-    # Bạn có thể tích hợp gọi HTTP sang Notification Service ở đây sau này
-
-    return {
-        "message": f"🎉 Chúc mừng! Thợ {request.worker_id} đã nhận đơn thành công.",
-        "order_uuid": order.order_uuid,
-        "status": order.status
+    # 4. 👉 PHÁT TIN REAL-TIME: Báo cho mọi người là đơn này ĐÃ ĐƯỢC NHẬN
+    # Để các thợ khác không thấy đơn này lảng vảng trên màn hình nữa
+    update_msg = {
+        "event": "ORDER_ACCEPTED",
+        "order_uuid": order_uuid,
+        "worker_id": request.worker_id,
+        "message": f"Thợ {request.worker_id} đã nhận đơn này!"
     }
+    await redis_client.publish("broadcast:workers", json.dumps(update_msg))
+
+    return {"status": "success", "message": "Bạn đã nhận đơn thành công!"}
 
 @app.put("/order/{order_uuid}/status", tags=["order"])
 async def update_order_status(order_uuid: str, request: OrderStatusUpdate, db: Session = Depends(get_db)):
