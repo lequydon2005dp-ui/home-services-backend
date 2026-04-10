@@ -86,7 +86,7 @@ async def find_best_worker(request: MatchRequest, db: Session = Depends(get_db))
         "message": f"Có đơn {request.service_type} mới cách bạn {round(best_worker['distance'], 1)}km!"
     }
     
-    redis_client.publish(f"user:{best_worker['worker_id']}", json.dumps(notification))
+    await redis_client.publish(f"user:{best_worker['worker_id']}", json.dumps(notification))
 
     return {
         "message": "✅ Đã tìm thấy thợ phù hợp và gửi tín hiệu nhận việc!",

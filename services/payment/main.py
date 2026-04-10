@@ -6,8 +6,12 @@ from shared.database import engine, Base, get_db
 from pydantic import BaseModel
 from datetime import datetime
 import httpx
+import json
+import redis.asyncio as redis
+from sqlalchemy import func
 
 app = FastAPI(title="Payment Service API")
+redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,7 +53,7 @@ class CODRequest(BaseModel):
 @app.post("/payment/create-url", tags=["Payment Checkout"])
 async def create_payment_url(req: PaymentCreate, db: Session = Depends(get_db)):
     # 1. Lưu giao dịch vào Database với trạng thái 'pending'
-    new_trans = Transaction(order_uuid=req.order_uuid, amount=req.amount)
+    new_trans = Transaction(order_uuid=req.order_uuid, amount=req.amount, status="pending")
     db.add(new_trans)
     db.commit()
 
@@ -61,6 +65,15 @@ async def create_payment_url(req: PaymentCreate, db: Session = Depends(get_db)):
         "checkout_url": mock_vnpay_url,
         "transaction_status": new_trans.status
     }
+    
+@app.on_event("startup")
+async def startup_event():
+    # Kiểm tra xem Redis có online không
+    try:
+        await redis_client.ping()
+        print("✅ Payment Service đã kết nối được với Redis!")
+    except Exception as e:
+        print(f"❌ Không thể kết nối Redis: {e}")
 
 # --- 4. API Webhook (Dành cho VNPay gọi vào khi khách đã quét mã) ---
 @app.post("/payment/webhook", tags=["Payment Webhook"])
@@ -88,7 +101,15 @@ async def vnpay_ipn_webhook(data: VNPayWebhook, db: Session = Depends(get_db)):
                 print(f"✅ Đơn {data.order_uuid} ĐÃ THỰC SỰ LÊN PAID!")
             else:
                 print(f"⚠️ Kêu Order nhưng bị chửi: {response.text}")
-                
+            
+            review_notif = {
+                "event": "REQUEST_REVIEW",
+                "order_uuid": data.order_uuid,
+                "message": "🌟 Tuyệt vời! Đơn hàng đã thanh toán. Mời bạn đánh giá chất lượng thợ nhé!"
+            }
+            # Giả sử Đôn bắn vào kênh chung hoặc kênh riêng của khách
+            await redis_client.publish(f"user:customer_{data.order_uuid}", json.dumps(review_notif))
+            
         except Exception as e:
             print(f"⚠️ Lỗi kết nối Order: {e}")
 
@@ -97,6 +118,18 @@ async def vnpay_ipn_webhook(data: VNPayWebhook, db: Session = Depends(get_db)):
 # --- API Xác nhận thu tiền mặt (Dành cho App của Thợ) ---
 @app.post("/payment/cod", tags=["Payment Checkout"])
 async def process_cod_payment(req: CODRequest, db: Session = Depends(get_db)):
+    
+    existing_trans = db.query(Transaction).filter(
+        Transaction.order_uuid == req.order_uuid,
+        Transaction.status == "success"  # Chỉ chặn nếu đã thành công
+    ).first()
+    
+    if existing_trans:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Đơn hàng này đã được thanh toán bằng {existing_trans.payment_method} rồi! Không thể thu tiền thêm."
+        )
+        
     # 1. Lưu giao dịch vào Database
     # Cực kỳ quan trọng để Admin biết thợ nào đang cầm tiền mặt của hệ thống
     new_trans = Transaction(
@@ -119,6 +152,12 @@ async def process_cod_payment(req: CODRequest, db: Session = Depends(get_db)):
         
         if response.status_code == 200:
             print(f"✅ Đơn {req.order_uuid} ĐÃ THỰC SỰ LÊN PAID!")
+            review_notif = {
+            "event": "REQUEST_REVIEW",
+            "order_uuid": req.order_uuid,
+            "message": "💵 Bạn đã thanh toán tiền mặt. Đừng quên đánh giá thợ 5 sao nếu bạn hài lòng nhé!"
+            }
+            await redis_client.publish(f"user:customer_{req.order_uuid}", json.dumps(review_notif))
         else:
             print(f"⚠️ Kêu Order nhưng bị chửi: {response.text}")
     except Exception as e:
@@ -130,3 +169,32 @@ async def process_cod_payment(req: CODRequest, db: Session = Depends(get_db)):
         "payment_method": "COD",
         "collected_by": req.worker_id
     }
+    
+@app.get("/admin/revenue/stats", tags=["Admin Dashboard"])
+async def get_revenue_stats(db: Session = Depends(get_db)):
+    # 1. Tính tổng tiền theo từng phương thức thanh toán
+    stats = db.query(
+        Transaction.payment_method,
+        func.sum(Transaction.amount).label("total_amount"),
+        func.count(Transaction.id).label("transaction_count")
+    ).filter(Transaction.status == "success").group_by(Transaction.payment_method).all()
+
+    # 2. Định dạng lại dữ liệu trả về cho đẹp
+    report = {item.payment_method: {"total": item.total_amount, "count": item.transaction_count} for item in stats}
+    
+    total_revenue = sum(item.total_amount for item in stats)
+    
+    return {
+        "status": "success",
+        "total_revenue": total_revenue,
+        "detail": report,
+        "generated_at": datetime.utcnow()
+    }
+    
+@app.get("/payment/history/{order_uuid}", tags=["Payment History"])
+async def get_payment_history(order_uuid: str, db: Session = Depends(get_db)):
+    # Lấy lịch sử giao dịch của một đơn hàng cụ thể (FR23)
+    history = db.query(Transaction).filter(Transaction.order_uuid == order_uuid).all()
+    if not history:
+        raise HTTPException(status_code=404, detail="Không tìm thấy lịch sử giao dịch cho đơn này")
+    return history
