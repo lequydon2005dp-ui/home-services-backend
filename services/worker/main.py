@@ -8,14 +8,20 @@ from sqlalchemy import Column, Integer, String, ARRAY, Float, DateTime, text, cr
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel, EmailStr, Field
+from fastapi import WebSocket, WebSocketDisconnect
+from websocket_manager import manager # Import bộ quản lý vừa tạo
 from typing import List, Optional
 from datetime import datetime
 import asyncio
 import uuid
+import redis.asyncio as redis
+import json
 
 # ✅ HARDCODE Docker URL
 DATABASE_URL = "postgresql://postgres:password@postgres:5432/home_services"
 print(f"🔗 Worker Using DATABASE_URL: {DATABASE_URL}")
+
+redis_client = redis.Redis.from_url("redis://redis:6379", decode_responses=True)
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -113,9 +119,19 @@ async def wait_for_db(max_retries=60, delay=1):
     print("❌ Worker DB timeout!")
     return False
 
+async def redis_listener():
+    pubsub = redis_client.pubsub()
+    await pubsub.subscribe("new_orders_channel")
+    async for message in pubsub.listen():
+        if message["type"] == "message":
+            data = json.loads(message["data"])
+            await manager.broadcast(data)
+            
 @app.on_event("startup")
-async def startup():
+async def startup_event():
+    # Chạy đồng thời việc đợi DB và nghe Redis
     await wait_for_db()
+    asyncio.create_task(redis_listener())
 
 @app.get("/", tags=["home"])
 async def root():
@@ -221,3 +237,12 @@ async def create_review(review: ReviewCreate, db: Session = Depends(get_db)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+@app.websocket("/ws/notifications/{worker_id}")
+async def websocket_endpoint(websocket: WebSocket, worker_id: str):
+    await manager.connect(websocket, worker_id)
+    try:
+        while True:
+            await websocket.receive_text() # Giữ kết nối
+    except WebSocketDisconnect:
+        manager.disconnect(worker_id)

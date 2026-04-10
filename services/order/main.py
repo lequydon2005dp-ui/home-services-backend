@@ -11,6 +11,8 @@ from datetime import datetime
 from typing import Optional
 import uuid
 import httpx # 👉 Thêm thư viện này để gọi API nội bộ
+import redis.asyncio as redis  # Thêm dòng này vào đầu file
+import json
 
 # Nên dùng biến môi trường, nhưng nếu Đôn đang test thì hardcode tạm cũng không sao!
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@postgres:5432/home_services")
@@ -45,12 +47,17 @@ class Order(Base):
     service_type = Column(String(50))
     address = Column(String(255))
     price = Column(Float)
+    assigned_worker_id = Column(String(50), nullable=True)
     status = Column(String(20), default="pending")
     lat = Column(Float)
     lng = Column(Float)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class AcceptJobRequest(BaseModel):
+    worker_id: str
+    
+class OrderStatusUpdate(BaseModel):
+    status: str      # Trạng thái muốn chuyển sang (in_progress, completed, cancelled)
     worker_id: str
     
 # ✅ RETRY LOGIC của Đôn - Rất tốt!
@@ -86,7 +93,7 @@ class OrderCreate(BaseModel):
 
 # URL của Matching Service trong mạng Docker
 MATCHING_SERVICE_URL = "http://matching-service:8000/matching/find"
-
+redis_client = redis.Redis.from_url("redis://redis:6379", decode_responses=True)
 @app.get("/health", tags=["health"])
 async def health():
     try:
@@ -105,6 +112,16 @@ async def create_order(order: OrderCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_order)
 
+    notification = {
+        "event": "NEW_ORDER",
+        "order_uuid": new_uuid,
+        "service_type": order.service_type,
+        "address": order.address,
+        "price": order.price,
+        "message": "Bạn Có Đơn Hàng Mới!"
+    }
+    await redis_client.publish("broadcast:workers", json.dumps(notification))
+    
     # 2. 👉 Tự động gọi sang Matching Service để tìm thợ
     matching_payload = {
         "order_uuid": new_uuid,
@@ -170,4 +187,64 @@ async def accept_order(order_uuid: str, request: AcceptJobRequest, db: Session =
         "message": f"🎉 Chúc mừng! Thợ {request.worker_id} đã nhận đơn thành công.",
         "order_uuid": order.order_uuid,
         "status": order.status
+    }
+
+@app.put("/order/{order_uuid}/status", tags=["order"])
+async def update_order_status(order_uuid: str, request: OrderStatusUpdate, db: Session = Depends(get_db)):
+    # 1. Tìm đơn hàng
+    order = db.query(Order).filter(Order.order_uuid == order_uuid).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Không tìm thấy đơn hàng này")
+
+    # 2. Bảo mật: Chỉ người thợ đã nhận đơn mới được phép cập nhật
+    if request.worker_id != "SYSTEM" and order.assigned_worker_id != request.worker_id:
+        raise HTTPException(status_code=403, detail="⚠️ Bạn không có quyền cập nhật đơn hàng của người khác!")
+
+    # 3. Máy trạng thái (State Machine): Chặn việc nhảy cóc trạng thái
+    valid_transitions = {
+        "pending": ["assigned", "cancelled"],
+        "assigned": ["in_progress", "cancelled"],     # Từ 'Đã nhận' chỉ có thể 'Đang làm' hoặc 'Hủy'
+        "in_progress": ["completed", "cancelled"],
+        "completed": ["paid"],
+        "paid": []
+        # Từ 'Đang làm' chỉ có thể 'Hoàn thành' hoặc 'Hủy'
+    }
+
+    # Nếu trạng thái hiện tại không có trong từ điển, hoặc trạng thái muốn chuyển tới không hợp lệ
+    current_status = order.status
+    if current_status not in valid_transitions or request.status not in valid_transitions[current_status]:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"❌ Thao tác không hợp lệ: Không thể chuyển trạng thái từ '{current_status}' sang '{request.status}'"
+        )
+
+    # 4. Lưu trạng thái mới
+    order.status = request.status
+    db.commit()
+
+    # (Tính năng mở rộng): Nếu trạng thái là 'completed', lúc này có thể gọi sang Payment Service
+    if request.status == "completed":
+        print(f"💰 Đơn {order_uuid} đã xong, chuẩn bị kích hoạt thanh toán!")
+        # await call_payment_service(...)
+
+    return {
+        "message": f"✅ Cập nhật thành công! Đơn hàng hiện đang ở trạng thái: {request.status}",
+        "order_uuid": order_uuid
+    }
+    
+@app.get("/order/{order_uuid}", tags=["order"])
+async def get_order_details(order_uuid: str, db: Session = Depends(get_db)):
+    order = db.query(Order).filter(Order.order_uuid == order_uuid).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Không tìm thấy đơn hàng")
+    
+    # Logic hiển thị thân thiện
+    payment_status = "Đã thanh toán" if order.status == "paid" else "Chưa thanh toán"
+    
+    return {
+        "order_uuid": order.order_uuid,
+        "current_status": order.status,
+        "price": order.price,
+        "payment_info": payment_status,
+        "worker_assigned": order.assigned_worker_id
     }

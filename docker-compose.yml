@@ -124,9 +124,14 @@ services:
     ports:
       - "8006:8000"
     depends_on:
+      - postgres
       - redis
+    volumes:
+      - ./services/payment:/app
+      - ./shared:/app/shared
     environment:
       - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/home_services
     restart: unless-stopped
 
   review-service:

@@ -88,4 +88,5 @@ async def search_services(q: str):
         return [] 
     except Exception as e:
         # Bắt các lỗi khác (như mất kết nối ES) để tránh app bị crash
+
         raise HTTPException(status_code=503, detail=f"Dịch vụ tìm kiếm đang gián đoạn: {str(e)}")
