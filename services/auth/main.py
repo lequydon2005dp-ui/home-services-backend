@@ -6,6 +6,9 @@ import jwt
 import os
 import httpx
 import base64
+from twilio.rest import Client
+import asyncio
+
 
 from shared.database import engine, get_db
 import models, schemas, crud
@@ -13,9 +16,16 @@ import models, schemas, crud
 # Khởi tạo DB
 models.Base.metadata.create_all(bind=engine)
 
+loop = asyncio.get_event_loop()
+
 SECRET_KEY = os.getenv("SECRET_KEY", "home-services-super-secret-key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+
+account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+
+twilio_client = Client(account_sid, auth_token) if account_sid and auth_token else None
 
 app = FastAPI(title="Auth Service API", version="1.0.0")
 
@@ -26,6 +36,13 @@ def create_access_token(data: dict):
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def format_phone(phone: str):
+    if phone.startswith("0"):
+        return "+84" + phone[1:]
+    if phone.startswith("84"):
+        return "+" + phone
+    return phone
 
 @app.post("/auth/register", response_model=schemas.UserResponse, tags=["auth"])
 async def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
@@ -49,50 +66,41 @@ async def send_otp(request: schemas.OTPRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản với SĐT này")
     
     otp_code = crud.create_otp(db, request.phone)
-    
-    # 🔥 SPEEDSMS OTP 
-    speedsms_token = os.getenv("SPEEDSMS_ACCESS_TOKEN")
-    
-    # Kiểm tra env vars trước
-    if not speedsms_token:
-        print("❌ Missing SPEEDSMS env vars!")
-        return {"message": f"OTP test: {otp_code}"}  # Fallback cho dev
-    
+
+    print("============== DEV MODE ==============")
+    print(f"Mã OTP cho SĐT {request.phone} là: {otp_code}")
+    print("======================================")
+
+    # 🔥 TWILIO CONFIG
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    twilio_phone = os.getenv("TWILIO_PHONE")
+
+    # fallback nếu thiếu env
+    if not account_sid or not auth_token or not twilio_phone:
+        print("❌ Missing Twilio env vars!")
+        return {"message": f"OTP test: {otp_code}"}
+
+
     try:
-        print(f"📱 Sending SMS to {request.phone} via SpeedSMS")
-        
-        # HTTP Cơ bản Auth: token:x
-        auth_str = f"{speedsms_token}:x"
-        b64_auth = base64.b64encode(auth_str.encode('ascii')).decode('ascii')
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.speedsms.vn/index.php/sms/send",
-                headers={
-                    "Authorization": f"Basic {b64_auth}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "to": [request.phone],
-                    "content": f"Home Services - Ma OTP cua ban la: {otp_code}. Co hieu luc trong 5 phut.",
-                    "sms_type": 4, 
-                    "sender": "" 
-                },
-                timeout=10.0
+        print(f"📱 Sending SMS to {request.phone} via Twilio")
+
+        message = await loop.run_in_executor(
+            None,
+            lambda: twilio_client.messages.create(
+                body=f"Home Services - Ma OTP cua ban la: {otp_code}. Co hieu luc 5 phut.",
+                from_=twilio_phone,
+                to=format_phone(request.phone)
             )
-            
-            res_data = response.json()
-            if res_data.get("status") == "success":
-                print(f"✅ SMS sent! SpeedSMS Res: {res_data}")
-                return {"message": "Mã OTP đã gửi qua SMS"}
-            else:
-                print(f"❌ SpeedSMS Error Response: {res_data}")
-                return {"message": f"Dev OTP: {otp_code} (SpeedSMS failed: {res_data.get('message')})"}
-                
+        )
+
+        print(f"✅ SMS sent! SID: {message.sid}")
+
+        return {"message": "Mã OTP đã gửi qua SMS"}
+
     except Exception as e:
-        print(f"❌ SMS Error: {str(e)}")
-        # VẪN TRẢ OTP CHO DEV (không break flow)
-        return {"message": f"Dev OTP: {otp_code} (SMS failed: {str(e)[:50]})"}
+        print(f"❌ Twilio Error: {repr(e)}")
+        return {"message": f"Dev OTP: {otp_code} (SMS failed)"}
 
 @app.post("/auth/login/otp", tags=["auth"])
 async def login_otp(request: schemas.OTPVerify, db: Session = Depends(get_db)):
