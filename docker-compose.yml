@@ -134,18 +134,6 @@ services:
       - DATABASE_URL=postgresql://postgres:password@postgres:5432/home_services
     restart: unless-stopped
 
-  review-service:
-    build: ./services/review
-    ports:
-      - "8007:8000"
-    depends_on:
-      - postgres
-    environment:
-      - DATABASE_URL=postgresql://postgres:password@postgres:5432/home_services
-    volumes:
-      - ./shared:/app/shared
-    restart: unless-stopped
-
   admin-service:
     build: ./services/admin
     ports:

@@ -238,6 +238,29 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
     
+# Thêm API này vào file worker-service/main.py
+@app.get("/worker/{worker_id}/reviews", tags=["Review & Rating"])
+async def get_worker_reviews(worker_id: str, db: Session = Depends(get_db)):
+    # 1. Lấy thông tin tổng quan của thợ
+    worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+    if not worker:
+        raise HTTPException(status_code=404, detail="Không tìm thấy thợ")
+
+    # 2. Lấy toàn bộ lịch sử đánh giá của thợ này
+    # Sắp xếp giảm dần (desc) để đánh giá mới nhất hiện lên đầu
+    reviews = db.query(Review).filter(
+        Review.worker_id == worker_id
+    ).order_by(Review.id.desc()).all()
+
+    # 3. Trả về cả list đánh giá lẫn số điểm tổng quát
+    return {
+        "worker_id": worker.worker_id,
+        "worker_name": worker.full_name,
+        "average_rating": worker.rating,
+        "total_reviews": worker.total_reviews,
+        "reviews": reviews # Chứa mảng các comment, số sao của từng khách
+    }
+    
 @app.websocket("/ws/notifications/{worker_id}")
 async def websocket_endpoint(websocket: WebSocket, worker_id: str):
     await manager.connect(websocket, worker_id)
